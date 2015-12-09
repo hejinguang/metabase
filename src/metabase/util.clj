@@ -150,7 +150,7 @@
      (case unit
        :minute-of-hour  (.get cal Calendar/MINUTE)
        :hour-of-day     (.get cal Calendar/HOUR_OF_DAY)
-       ;; 1 = Sunday <-> 6 = Saturday
+       ;; 1 = Sunday <-> 7 = Saturday
        :day-of-week     (.get cal Calendar/DAY_OF_WEEK)
        :day-of-month    (.get cal Calendar/DAY_OF_MONTH)
        :day-of-year     (.get cal Calendar/DAY_OF_YEAR)
@@ -519,6 +519,18 @@
      (round-to-decimals 2 35.5058998M) -> 35.51"
   ^Double [^Integer decimal-place, ^Number number]
   (double (.setScale (bigdec number) decimal-place BigDecimal/ROUND_HALF_UP)))
+
+(defn string-or-keyword?
+  "Is X a string or a keyword?"
+  [x]
+  (or (string? x) (keyword? x)))
+
+(defn nil-or?
+  "True if X is `nil` or statisfies PRED.
+
+     (nil-or? map? x) -> (or (nil? x) (map? x))"
+  [pred x]
+  (or (nil? x) (map? x)))
 
 
 (require-dox-in-this-namespace)
