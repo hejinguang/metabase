@@ -4,7 +4,7 @@ import moment from "moment";
 
 // resource wrappers
 const CardApi = new AngularResourceProxy("Card", ["list"]);
-const MetadataApi = new AngularResourceProxy("Metabase", ["db_list", "db_metadata"]);
+const MetabaseApi = new AngularResourceProxy("Metabase", ["db_list", "db_metadata"]);
 
 
 // action constants
@@ -48,7 +48,7 @@ export const setCardsFilter = createThunkAction(SET_CARDS_FILTER, function(filte
 
 export const fetchCards = createThunkAction(FETCH_CARDS, function(filterMode, filterModelId) {
     return async function(dispatch, getState) {
-        let cards = await CardApi.list({'filterMode' : filterMode, 'model_id' : filterModelId });
+        let cards = await CardApi.list({ f: filterMode, model_id: filterModelId });
         for (var c of cards) {
             c.created_at = moment(c.created_at);
             c.updated_at = moment(c.updated_at);
@@ -59,7 +59,7 @@ export const fetchCards = createThunkAction(FETCH_CARDS, function(filterMode, fi
 
 export const fetchDatabases = createThunkAction(FETCH_DATABASES, function() {
     return async function(dispatch, getState) {
-        return await MetadataApi.db_list();
+        return await MetabaseApi.db_list();
     };
 });
 
@@ -68,6 +68,6 @@ export const clearDatabaseMetadata = createAction(CLEAR_DATABASE_METADATA);
 
 export const fetchDatabaseMetadata = createThunkAction(FETCH_DATABASE_METADATA, function(database_id) {
     return async function(dispatch, getState) {
-        return await MetadataApi.db_metadata({'dbId': database_id});
+        return await MetabaseApi.db_metadata({'dbId': database_id});
     };
 });

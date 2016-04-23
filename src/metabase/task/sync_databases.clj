@@ -1,16 +1,17 @@
 (ns metabase.task.sync-databases
-  (:require [clojure.tools.logging :as log]
+  (:require [clj-time.core :as t]
+            [clojure.tools.logging :as log]
             (clojurewerkz.quartzite [jobs :as jobs]
                                     [triggers :as triggers])
             [clojurewerkz.quartzite.schedule.cron :as cron]
-            (metabase [config :as config]
-                      [db :as db]
-                      [driver :as driver]
+            (metabase [db :as db]
                       [task :as task])
-            [metabase.models.database :refer [Database]]))
+            [metabase.driver :as driver]
+            [metabase.models.database :refer [Database]]
+            [metabase.sync-database :as sync-database]))
 
-(def sync-databases-job-key "metabase.task.sync-databases.job")
-(def sync-databases-trigger-key "metabase.task.sync-databases.trigger")
+(def ^:private ^:const sync-databases-job-key     "metabase.task.sync-databases.job")
+(def ^:private ^:const sync-databases-trigger-key "metabase.task.sync-databases.trigger")
 
 (defonce ^:private sync-databases-job (atom nil))
 (defonce ^:private sync-databases-trigger (atom nil))
@@ -22,12 +23,18 @@
     (for [database (db/sel :many Database :is_sample false)] ; skip Sample Dataset DB
       (try
         ;; NOTE: this happens synchronously for now to avoid excessive load if there are lots of databases
-        (driver/sync-database! database)
-        (catch Exception e
+        (if-not (and (= 0 (t/hour (t/now)))
+                     (driver/driver-supports? (driver/engine->driver (:engine database)) :dynamic-schema))
+          ;; most of the time we do a quick sync and avoid the lengthy analysis process
+          (sync-database/sync-database! database :full-sync? false)
+          ;; at midnight we run the full sync
+          (sync-database/sync-database! database :full-sync? true))
+        (catch Throwable e
           (log/error "Error syncing database: " (:id database) e))))))
 
-(defn task-init []
-  (log/info "Submitting sync-database task to scheduler")
+(defn task-init
+  "Automatically called during startup; start the job for syncing databases."
+  []
   ;; build our job
   (reset! sync-databases-job (jobs/build
                                (jobs/of-type SyncDatabases)
@@ -37,7 +44,7 @@
                                    (triggers/with-identity (triggers/key sync-databases-trigger-key))
                                    (triggers/start-now)
                                    (triggers/with-schedule
-                                     ;; run at midnight daily
-                                     (cron/schedule (cron/cron-schedule "0 0 0 * * ? *")))))
+                                     ;; run at the end of every hour
+                                     (cron/cron-schedule "0 50 * * * ? *"))))
   ;; submit ourselves to the scheduler
   (task/schedule-task! @sync-databases-job @sync-databases-trigger))

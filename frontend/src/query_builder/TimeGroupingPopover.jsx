@@ -21,7 +21,7 @@ const BUCKETINGS = [
     // "day-of-year",
     "week-of-year",
     "month-of-year",
-    // "quarter-of-year",
+    "quarter-of-year",
 ];
 
 export default class TimeGroupingPopover extends Component {
@@ -48,9 +48,9 @@ export default class TimeGroupingPopover extends Component {
                 <ul className="py1">
                 { BUCKETINGS.map((bucketing, bucketingIndex) =>
                     bucketing == null ?
-                        <hr style={{ "border": "none" }}/>
+                        <hr key={bucketingIndex} style={{ "border": "none" }}/>
                     :
-                        <li className={cx("List-item", { "List-item--selected": parseFieldBucketing(field) === bucketing })}>
+                        <li key={bucketingIndex} className={cx("List-item", { "List-item--selected": parseFieldBucketing(field) === bucketing })}>
                             <a className="List-item-title full px2 py1 cursor-pointer" onClick={this.setField.bind(this, bucketing)}>
                                 {formatBucketing(bucketing)}
                             </a>

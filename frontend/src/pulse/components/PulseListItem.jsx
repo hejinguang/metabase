@@ -1,7 +1,9 @@
 import React, { Component, PropTypes } from "react";
+import ReactDOM from "react-dom";
 
 import cx from "classnames";
 
+import Urls from "metabase/lib/urls";
 import PulseListChannel from "./PulseListChannel.jsx";
 
 export default class PulseListItem extends Component {
@@ -13,7 +15,7 @@ export default class PulseListItem extends Component {
 
     componentDidMount() {
         if (this.props.scrollTo) {
-            const element = React.findDOMNode(this.refs.pulseListItem);
+            const element = ReactDOM.findDOMNode(this.refs.pulseListItem);
             element.scrollIntoView(true);
         }
     }
@@ -32,18 +34,18 @@ export default class PulseListItem extends Component {
                         <a className="PulseEditButton PulseButton Button no-decoration text-bold" href={"/pulse/" + pulse.id}>Edit</a>
                     </div>
                 </div>
-                <ol className="mb2 px4 flex">
+                <ol className="mb2 px4 flex flex-wrap">
                     { pulse.cards.map((card, index) =>
-                        <li key={index} className="mr1">
-                            <a className="Button" href={"/card/"+card.id+"?clone"}>
+                        <li key={index} className="mr1 mb1">
+                            <a className="Button" href={Urls.card(card.id)}>
                                 {card.name}
                             </a>
                         </li>
                     )}
                 </ol>
                 <ul className="border-top px4 bg-grey-0">
-                    {pulse.channels.map(channel =>
-                        <li className="border-row-divider">
+                    {pulse.channels.filter(channel => channel.enabled).map(channel =>
+                        <li key={channel.id} className="border-row-divider">
                             <PulseListChannel
                                 pulse={pulse}
                                 channel={channel}

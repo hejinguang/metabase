@@ -1,5 +1,7 @@
 import React, { Component, PropTypes } from "react";
 
+import styles from "./Toggle.css";
+
 import cx from "classnames";
 
 export default class Toggle extends Component {
@@ -22,10 +24,9 @@ export default class Toggle extends Component {
     render() {
         return (
             <a
-                href="#"
-                className={cx("Toggle", "no-decoration", { selected: this.props.value }) + " " + (this.props.className||"")}
+                className={cx(styles.toggle, "no-decoration", { [styles.selected]: this.props.value }) + " " + (this.props.className||"")}
                 style={{color: this.props.color || null}}
-                onClick={this.onClick}
+                onClick={this.props.onChange ? this.onClick : null}
             />
         );
     }

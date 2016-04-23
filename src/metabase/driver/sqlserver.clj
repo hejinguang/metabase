@@ -2,15 +2,15 @@
   (:require [clojure.string :as s]
             (korma [core :as k]
                    [db :as kdb])
-            [korma.sql.utils :as kutils]
             [metabase.driver :as driver]
             [metabase.driver.generic-sql :as sql]
+            [metabase.util :as u]
             [metabase.util.korma-extensions :as kx])
   (:import net.sourceforge.jtds.jdbc.Driver)) ; need to import this in order to load JDBC driver
 
 (defn- column->base-type
   "See [this page](https://msdn.microsoft.com/en-us/library/ms187752.aspx) for details."
-  [_ column-type]
+  [column-type]
   ({:bigint           :BigIntegerField
      :binary           :UnknownField
      :bit              :BooleanField ; actually this is 1 / 0 instead of true / false ...
@@ -48,15 +48,27 @@
      :xml              :UnknownField
      (keyword "int identity") :IntegerField} column-type)) ; auto-incrementing integer (ie pk) field
 
-(defn- connection-details->spec [_ {:keys [instance], :as details}]
-  (-> (kdb/mssql details)
+(defn- connection-details->spec [{:keys [domain instance ssl], :as details}]
+  (-> ;; Having the `:ssl` key present, even if it is `false`, will make the driver attempt to connect with SSL
+      (kdb/mssql (if ssl
+                   details
+                   (dissoc details :ssl)))
       ;; swap out Microsoft Driver details for jTDS ones
       (assoc :classname   "net.sourceforge.jtds.jdbc.Driver"
              :subprotocol "jtds:sqlserver")
+
       ;; adjust the connection URL to match up with the jTDS format (see http://jtds.sourceforge.net/faq.html#urlFormat)
-      ;; and add the ;instance= option if applicable
-      (update :subname #(cond-> (s/replace % #";database=" "/")
-                          (seq instance) (str ";instance=" instance)))))
+      (update :subname (fn [subname]
+                         ;; jTDS uses a "/" instead of ";database="
+                         (cond-> (s/replace subname #";database=" "/")
+                           ;; and add the ;instance= option if applicable
+                           (seq instance) (str ";instance=" instance)
+
+                           ;; add Windows domain for Windows domain authentication if applicable. useNTLMv2 = send LMv2/NTLMv2 responses when using Windows auth
+                           (seq domain) (str ";domain=" domain ";useNTLMv2=true")
+
+                           ;; If SSL is specified append ;ssl=require, which enables SSL and throws exception if SSL connection cannot be made
+                           ssl (str ";ssl=require"))))))
 
 (defn- date-part [unit expr]
   (k/sqlfn :DATEPART (k/raw (name unit)) expr))
@@ -66,9 +78,9 @@
 
 (defn- date
   "See also the [jTDS SQL <-> Java types table](http://jtds.sourceforge.net/typemap.html)"
-  [_ unit expr]
+  [unit expr]
   (case unit
-    :default         (kx/->datetime expr)
+    :default         expr
     :minute          (kx/cast :SMALLDATETIME expr)
     :minute-of-hour  (date-part :minute expr)
     :hour            (kx/->datetime (kx/format "yyyy-MM-dd HH:00:00" expr))
@@ -98,21 +110,21 @@
     :quarter-of-year (date-part :quarter expr)
     :year            (date-part :year expr)))
 
-(defn- date-interval [_ unit amount]
+(defn- date-interval [unit amount]
   (date-add unit amount (k/sqlfn :GETUTCDATE)))
 
-(defn- unix-timestamp->timestamp [_ expr seconds-or-milliseconds]
+(defn- unix-timestamp->timestamp [expr seconds-or-milliseconds]
   (case seconds-or-milliseconds
     ;; The second argument to DATEADD() gets casted to a 32-bit integer. BIGINT is 64 bites, so we tend to run into
     ;; integer overflow errors (especially for millisecond timestamps).
     ;; Work around this by converting the timestamps to minutes instead before calling DATEADD().
     :seconds      (date-add :minute (kx// expr 60) (kx/literal "1970-01-01"))
-    :milliseconds (recur nil (kx// expr 1000) :seconds)))
+    :milliseconds (recur (kx// expr 1000) :seconds)))
 
-(defn- apply-limit [_ korma-query {value :limit}]
+(defn- apply-limit [korma-query {value :limit}]
   (k/modifier korma-query (format "TOP %d" value)))
 
-(defn- apply-page [_ korma-query {{:keys [items page]} :page}]
+(defn- apply-page [korma-query {{:keys [items page]} :page}]
   (k/offset korma-query (format "%d ROWS FETCH NEXT %d ROWS ONLY"
                                 (* items (dec page))
                                 items)))
@@ -121,10 +133,10 @@
   clojure.lang.Named
   (getName [_] "SQL Server"))
 
-(extend SQLServerDriver
+(u/strict-extend SQLServerDriver
   driver/IDriver
   (merge (sql/IDriverSQLDefaultsMixin)
-         {:date-interval  date-interval
+         {:date-interval  (u/drop-first-arg date-interval)
           :details-fields (constantly [{:name         "host"
                                         :display-name "Host"
                                         :default      "localhost"}
@@ -139,6 +151,9 @@
                                        {:name         "instance"
                                         :display-name "Database instance name"
                                         :placeholder  "N/A"}
+                                       {:name         "domain"
+                                        :display-name "Windows domain"
+                                        :placeholder  "N/A"}
                                        {:name         "user"
                                         :display-name "Database username"
                                         :placeholder  "What username do you use to login to the database?"
@@ -146,19 +161,23 @@
                                        {:name         "password"
                                         :display-name "Database password"
                                         :type         :password
-                                        :placeholder  "*******"}])})
+                                        :placeholder  "*******"}
+                                       {:name         "ssl"
+                                        :display-name "Use a secure connection (SSL)?"
+                                        :type         :boolean
+                                        :default      false}])})
 
   sql/ISQLDriver
   (merge (sql/ISQLDriverDefaultsMixin)
-         {:apply-limit               apply-limit
-          :apply-page                apply-page
-          :column->base-type         column->base-type
-          :connection-details->spec  connection-details->spec
+         {:apply-limit               (u/drop-first-arg apply-limit)
+          :apply-page                (u/drop-first-arg apply-page)
+          :column->base-type         (u/drop-first-arg column->base-type)
+          :connection-details->spec  (u/drop-first-arg connection-details->spec)
           :current-datetime-fn       (constantly (k/sqlfn* :GETUTCDATE))
-          :date                      date
+          :date                      (u/drop-first-arg date)
           :excluded-schemas          (constantly #{"sys" "INFORMATION_SCHEMA"})
           :stddev-fn                 (constantly :STDEV)
           :string-length-fn          (constantly :LEN)
-          :unix-timestamp->timestamp unix-timestamp->timestamp}))
+          :unix-timestamp->timestamp (u/drop-first-arg unix-timestamp->timestamp)}))
 
 (driver/register-driver! :sqlserver (SQLServerDriver.))

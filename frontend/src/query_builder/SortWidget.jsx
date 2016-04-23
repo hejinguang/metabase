@@ -4,16 +4,19 @@ import Icon from "metabase/components/Icon.jsx";
 import FieldWidget from './FieldWidget.jsx';
 import SelectionModule from './SelectionModule.jsx';
 
+import _ from "underscore";
+
 export default class SortWidget extends Component {
     constructor(props, context) {
         super(props, context);
-        this.setDirection = this.setDirection.bind(this);
-        this.setField = this.setField.bind(this);
+
+        _.bindAll(this, "setDirection", "setField");
     }
 
     static propTypes = {
         sort: PropTypes.array.isRequired,
         fieldOptions: PropTypes.object.isRequired,
+        customFieldOptions: PropTypes.object,
         tableName: PropTypes.string,
         updateSort: PropTypes.func.isRequired,
         removeSort: PropTypes.func.isRequired,
@@ -31,15 +34,26 @@ export default class SortWidget extends Component {
         });
     }
 
+    componentWillUnmount() {
+        // Remove partially completed sort if the widget is removed
+        if (this.state.field == null || this.state.direction == null) {
+            this.props.removeSort();
+        }
+    }
+
     setField(value) {
         if (this.state.field !== value) {
             this.props.updateSort([value, this.state.direction]);
+            // Optimistically set field state so componentWillUnmount logic works correctly
+            this.setState({ field: value });
         }
     }
 
     setDirection(value) {
         if (this.state.direction !== value) {
             this.props.updateSort([this.state.field, value]);
+            // Optimistically set direction state so componentWillUnmount logic works correctly
+            this.setState({ direction: value });
         }
     }
 
@@ -56,6 +70,7 @@ export default class SortWidget extends Component {
                     tableMetadata={this.props.tableMetadata}
                     field={this.state.field}
                     fieldOptions={this.props.fieldOptions}
+                    customFieldOptions={this.props.customFieldOptions}
                     setField={this.setField}
                     isInitiallyOpen={this.state.field === null}
                     enableTimeGrouping={false}

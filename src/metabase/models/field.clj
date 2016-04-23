@@ -1,17 +1,14 @@
 (ns metabase.models.field
-  (:require [korma.core :refer :all, :exclude [defentity update]]
-            [metabase.api.common :refer [check]]
-            [metabase.db :refer :all]
+  (:require [clojure.data :as d]
+            [clojure.string :as s]
+            [korma.core :as k]
+            [medley.core :as m]
+            [metabase.db :as db]
             (metabase.models [common :as common]
-                             [database :refer [Database]]
-                             [field-values :refer [FieldValues field-should-have-field-values? create-field-values-if-needed]]
+                             [field-values :refer [FieldValues]]
                              [foreign-key :refer [ForeignKey]]
-                             [hydrate :refer [hydrate]]
-                             [interface :refer :all])
+                             [interface :as i])
             [metabase.util :as u]))
-
-(declare field->fk-field
-         qualified-name-components)
 
 (def ^:const special-types
   "Possible values for `Field.special_type`."
@@ -36,7 +33,8 @@
 
 (def ^:const base-types
   "Possible values for `Field.base_type`."
-  #{:BigIntegerField
+  #{:ArrayField
+    :BigIntegerField
     :BooleanField
     :CharField
     :DateField
@@ -54,96 +52,195 @@
   "Possible values for `Field.field_type`."
   #{:metric      ; A number that can be added, graphed, etc.
     :dimension   ; A high or low-cardinality numerical string value that is meant to be used as a grouping
-    :info        ; Non-numerical value that is not meant to be used
-    :sensitive}) ; A Fields that should *never* be shown *anywhere*
+    :info})      ; Non-numerical value that is not meant to be used
 
-(defrecord FieldInstance []
-  clojure.lang.IFn
-  (invoke [this k]
-    (get this k)))
+(def ^:const visibility-types
+  "Possible values for `Field.visibility_type`."
+  #{:normal         ; Default setting.  field has no visibility restrictions.
+    :details-only   ; For long blob like columns such as JSON.  field is not shown in some places on the frontend.
+    :hidden         ; Lightweight hiding which removes field as a choice in most of the UI.  should still be returned in queries.
+    :sensitive      ; Strict removal of field from all places except data model listing.  queries should error if someone attempts to access.
+    :retired})      ; For fields that no longer exist in the physical db.  automatically set by Metabase.  QP should error if encountered in a query.
 
-(extend-ICanReadWrite FieldInstance :read :always, :write :superuser)
-
-
-(defentity Field
-  [(table :metabase_field)
-   (hydration-keys destination field origin)
-   (types :base_type :keyword, :field_type :keyword, :special_type :keyword)
-   timestamped]
-
-  (pre-insert [_ field]
-    (let [defaults {:active          true
-                    :preview_display true
-                    :field_type      :info
-                    :position        0
-                    :display_name    (common/name->human-readable-name (:name field))}]
-      (merge defaults field)))
-
-  (post-insert [_ field]
-    (when (field-should-have-field-values? field)
-      (create-field-values-if-needed field))
-    field)
-
-  (post-update [this {:keys [id] :as field}]
-    ;; if base_type or special_type were affected then we should asynchronously create corresponding FieldValues objects if need be
-    (when (or (contains? field :base_type)
-              (contains? field :field_type)
-              (contains? field :special_type))
-      (create-field-values-if-needed (sel :one [this :id :table_id :base_type :special_type :field_type] :id id))))
-
-  (post-select [this {:keys [id table_id parent_id] :as field}]
-    (map->FieldInstance
-      (u/assoc* field
-        :table                     (delay (sel :one 'metabase.models.table/Table :id table_id))
-        :db                        (delay @(:db @(:table <>)))
-        :target                    (delay (field->fk-field field))
-        :parent                    (when parent_id
-                                     (delay (this parent_id)))
-        :children                  (delay (sel :many this :parent_id (:id field)))
-        :values                    (delay (sel :many [FieldValues :field_id :values] :field_id id))
-        :qualified-name-components (delay (qualified-name-components <>))
-        :qualified-name            (delay (apply str (interpose "." @(:qualified-name-components <>)))))))
-
-  (pre-cascade-delete [this {:keys [id]}]
-    (cascade-delete this :parent_id id)
-    (cascade-delete ForeignKey (where (or (= :origin_id id)
-                                          (= :destination_id id))))
-    (cascade-delete 'metabase.models.field-values/FieldValues :field_id id)))
-
-(extend-ICanReadWrite FieldEntity :read :always, :write :superuser)
+(defn valid-metadata?
+  "Predicate function that checks if the set of metadata types for a field are sensible."
+  [base-type field-type special-type visibility-type]
+  (and (contains? base-types base-type)
+       (contains? field-types field-type)
+       (contains? visibility-types visibility-type)
+       (or (nil? special-type)
+           (contains? special-types special-type))
+       ;; this verifies that we have a numeric base-type when trying to use the unix timestamp transform (#824)
+       (or (nil? special-type)
+           (not (contains? #{:timestamp_milliseconds :timestamp_seconds} special-type))
+           (contains? #{:BigIntegerField :DecimalField :FloatField :IntegerField} base-type))))
 
 
-(defn field->fk-field
-  "Attempts to follow a `ForeignKey` from the the given `Field` to a destination `Field`.
+(i/defentity Field :metabase_field)
 
-   Only evaluates if the given field has :special_type `fk`, otherwise does nothing."
-  [{:keys [id special_type] :as field}]
-  (when (= :fk special_type)
-    (let [dest-id (sel :one :field [ForeignKey :destination_id] :origin_id id)]
-      (Field dest-id))))
+(defn- pre-insert [field]
+  (let [defaults {:active          true
+                  :preview_display true
+                  :field_type      :info
+                  :visibility_type :normal
+                  :position        0
+                  :display_name    (common/name->human-readable-name (:name field))}]
+    (merge defaults field)))
 
-(defn unflatten-nested-fields
-  "Take a sequence of both top-level and nested FIELDS, and return a sequence of top-level `Fields`
-   with nested `Fields` moved into sequences keyed by `:children` in their parents.
+(defn- pre-cascade-delete [{:keys [id]}]
+  (db/cascade-delete Field :parent_id id)
+  (db/cascade-delete ForeignKey (k/where (or (= :origin_id id)
+                                             (= :destination_id id))))
+  (db/cascade-delete 'FieldValues :field_id id))
 
-     (unflatten-nested-fields [{:id 1, :parent_id nil}, {:id 2, :parent_id 1}])
-       -> [{:id 1, :parent_id nil, :children [{:id 2, :parent_id 1, :children nil}]}]
+(defn ^:hydrate target
+  "Return the FK target `Field` that this `Field` points to."
+  [{:keys [special_type fk_target_field_id]}]
+  (when (and (= :fk special_type)
+             fk_target_field_id)
+    (Field fk_target_field_id)))
 
-   You may optionally specify a different PARENT-ID-KEY; the default is `:parent_id`."
-  ([fields]
-   (unflatten-nested-fields fields :parent_id))
-  ([fields parent-id-key]
-   (let [parent-id->fields (group-by parent-id-key fields)
-         resolve-children  (fn resolve-children [field]
-                             (assoc field :children (map resolve-children
-                                                         (parent-id->fields (:id field)))))]
-     (map resolve-children (parent-id->fields nil)))))
+(defn ^:hydrate values
+  "Return the `FieldValues` associated with this FIELD."
+  [{:keys [id]}]
+  (db/sel :many [FieldValues :field_id :values], :field_id id))
 
-(defn- qualified-name-components
+(defn qualified-name-components
   "Return the pieces that represent a path to FIELD, of the form `[table-name parent-fields-name* field-name]`."
-  [{:keys [table parent], :as field}]
-  {:pre [(delay? table)]}
-  (conj (if parent
-          (qualified-name-components @parent)
-          [(:name @table)])
-        (:name field)))
+  [{field-name :name, table-id :table_id, parent-id :parent_id}]
+  (conj (if-let [parent (Field parent-id)]
+          (qualified-name-components parent)
+          [(db/sel :one :field ['Table :name], :id table-id)])
+        field-name))
+
+(defn qualified-name
+  "Return a combined qualified name for FIELD, e.g. `table_name.parent_field_name.field_name`."
+  [field]
+  (apply str (interpose \. (qualified-name-components field))))
+
+(defn table
+  "Return the `Table` associated with this `Field`."
+  {:arglists '([field])}
+  [{:keys [table_id]}]
+  (db/sel :one 'Table, :id table_id))
+
+(u/strict-extend (class Field)
+  i/IEntity (merge i/IEntityDefaults
+                   {:hydration-keys     (constantly [:destination :field :origin])
+                    :types              (constantly {:base_type       :keyword
+                                                     :field_type      :keyword
+                                                     :special_type    :keyword
+                                                     :visibility_type :keyword
+                                                     :description     :clob})
+                    :timestamped?       (constantly true)
+                    :can-read?          (constantly true)
+                    :can-write?         i/superuser?
+                    :pre-insert         pre-insert
+                    :pre-cascade-delete pre-cascade-delete}))
+
+
+(def ^{:arglists '([field-name base-type])} infer-field-special-type
+  "If `name` and `base-type` matches a known pattern, return the `special_type` we should assign to it."
+  (let [bool-or-int #{:BooleanField :BigIntegerField :IntegerField}
+        float       #{:DecimalField :FloatField}
+        int-or-text #{:BigIntegerField :IntegerField :CharField :TextField}
+        text        #{:CharField :TextField}
+        ;; tuples of [pattern set-of-valid-base-types special-type
+        ;; * Convert field name to lowercase before matching against a pattern
+        ;; * consider a nil set-of-valid-base-types to mean "match any base type"
+        pattern+base-types+special-type [[#"^.*_lat$"       float       :latitude]
+                                         [#"^.*_lon$"       float       :longitude]
+                                         [#"^.*_lng$"       float       :longitude]
+                                         [#"^.*_long$"      float       :longitude]
+                                         [#"^.*_longitude$" float       :longitude]
+                                         [#"^.*_rating$"    int-or-text :category]
+                                         [#"^.*_type$"      int-or-text :category]
+                                         [#"^.*_url$"       text        :url]
+                                         [#"^_latitude$"    float       :latitude]
+                                         [#"^active$"       bool-or-int :category]
+                                         [#"^city$"         text        :city]
+                                         [#"^country$"      text        :country]
+                                         [#"^countryCode$"  text        :country]
+                                         [#"^currency$"     int-or-text :category]
+                                         [#"^first_name$"   text        :name]
+                                         [#"^full_name$"    text        :name]
+                                         [#"^gender$"       int-or-text :category]
+                                         [#"^last_name$"    text        :name]
+                                         [#"^lat$"          float       :latitude]
+                                         [#"^latitude$"     float       :latitude]
+                                         [#"^lon$"          float       :longitude]
+                                         [#"^lng$"          float       :longitude]
+                                         [#"^long$"         float       :longitude]
+                                         [#"^longitude$"    float       :longitude]
+                                         [#"^name$"         text        :name]
+                                         [#"^postalCode$"   int-or-text :zip_code]
+                                         [#"^postal_code$"  int-or-text :zip_code]
+                                         [#"^rating$"       int-or-text :category]
+                                         [#"^role$"         int-or-text :category]
+                                         [#"^sex$"          int-or-text :category]
+                                         [#"^state$"        text        :state]
+                                         [#"^status$"       int-or-text :category]
+                                         [#"^type$"         int-or-text :category]
+                                         [#"^url$"          text        :url]
+                                         [#"^zip_code$"     int-or-text :zip_code]
+                                         [#"^zipcode$"      int-or-text :zip_code]]]
+    ;; Check that all the pattern tuples are valid
+    (doseq [[name-pattern base-types special-type] pattern+base-types+special-type]
+      (assert (= (type name-pattern) java.util.regex.Pattern))
+      (assert (every? (partial contains? base-types) base-types))
+      (assert (contains? special-types special-type)))
+
+    (fn [field-name base_type]
+      (when (and (string? field-name)
+                 (keyword? base_type))
+        (or (when (= "id" (s/lower-case field-name)) :id)
+            (when-let [matching-pattern (m/find-first (fn [[name-pattern valid-base-types _]]
+                                                        (and (or (nil? valid-base-types)
+                                                                 (contains? valid-base-types base_type))
+                                                             (re-matches name-pattern (s/lower-case field-name))))
+                                                      pattern+base-types+special-type)]
+              ;; the actual special-type is the last element of the pattern
+              (last matching-pattern)))))))
+
+
+(defn update-field
+  "Update an existing `Field` from the given FIELD-DEF."
+  [{:keys [id], :as existing-field} {field-name :name, :keys [base-type special-type pk? parent-id]}]
+  (let [updated-field (assoc existing-field
+                        :base_type    base-type
+                        :display_name (or (:display_name existing-field)
+                                          (common/name->human-readable-name field-name))
+                        :special_type (or (:special_type existing-field)
+                                          special-type
+                                          (when pk? :id)
+                                          (infer-field-special-type field-name base-type))
+
+                        :parent_id    parent-id)
+        [is-diff? _ _] (d/diff updated-field existing-field)]
+    ;; if we have a different base-type or special-type, then update
+    (when is-diff?
+      (db/upd Field id
+              :display_name (:display_name updated-field)
+              :base_type    base-type
+              :special_type (:special_type updated-field)
+              :parent_id    parent-id))
+    ;; return the updated field when we are done
+    updated-field))
+
+
+(defn create-field
+  "Create a new `Field` from the given FIELD-DEF."
+  [table-id {field-name :name, :keys [base-type special-type pk? parent-id raw-column-id]}]
+  {:pre [(integer? table-id)
+         (string? field-name)
+         (contains? base-types base-type)]}
+  (db/ins Field
+          :table_id       table-id
+          :raw_column_id  raw-column-id
+          :name           field-name
+          :display_name   (common/name->human-readable-name field-name)
+          :base_type      base-type
+          :special_type   (or special-type
+                              (when pk? :id)
+                              (infer-field-special-type field-name base-type))
+          :parent_id      parent-id))

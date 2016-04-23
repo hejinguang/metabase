@@ -1,12 +1,16 @@
 (ns metabase.util
   "Common utility functions useful throughout the codebase."
-  (:require [clj-time.coerce :as coerce]
-            [clj-time.format :as time]
+  (:require [clojure.data :as data]
             [clojure.java.jdbc :as jdbc]
-            [clojure.pprint :refer [pprint]]
+            [clojure.math.numeric-tower :as math]
+            (clojure [pprint :refer [pprint]]
+                     [string :as s])
             [clojure.tools.logging :as log]
-            [colorize.core :as color]
-            [medley.core :as m])
+            [clj-time.core :as t]
+            [clj-time.coerce :as coerce]
+            [clj-time.format :as time]
+            colorize.core
+            [metabase.config :as config])
   (:import clojure.lang.Keyword
            (java.net Socket
                      InetSocketAddress
@@ -15,6 +19,9 @@
            (java.util Calendar TimeZone)
            javax.xml.bind.DatatypeConverter
            org.joda.time.format.DateTimeFormatter))
+
+;; Set the default width for pprinting to 240 instead of 72. The default width is too narrow and wastes a lot of space for pprinting huge things like expanded queries
+(intern 'clojure.pprint '*print-right-margin* 240)
 
 (declare pprint-to-str)
 
@@ -58,7 +65,32 @@
                                                                                (pprint-to-str (sort (keys time/formatters)))))))))
 
 
+(defprotocol ISO8601
+  "Protocol for converting objects to ISO8601 formatted strings."
+  (->iso-8601-datetime ^String [this timezone-id]
+    "Coerce object to an ISO8601 date-time string such as \"2015-11-18T23:55:03.841Z\" with a given TIMEZONE."))
+
+(def ^:private ISO8601Formatter
+  ;; memoize this because the formatters are static.  they must be distinct per timezone though.
+  (memoize (fn [timezone-id]
+             (if timezone-id (time/with-zone (time/formatters :date-time) (t/time-zone-for-id timezone-id))
+                             (time/formatters :date-time)))))
+
+(extend-protocol ISO8601
+  nil                    (->iso-8601-datetime [_ _] nil)
+  java.util.Date         (->iso-8601-datetime [this timezone-id] (time/unparse (ISO8601Formatter timezone-id) (coerce/from-date this)))
+  java.sql.Date          (->iso-8601-datetime [this timezone-id] (time/unparse (ISO8601Formatter timezone-id) (coerce/from-sql-date this)))
+  java.sql.Timestamp     (->iso-8601-datetime [this timezone-id] (time/unparse (ISO8601Formatter timezone-id) (coerce/from-sql-time this)))
+  org.joda.time.DateTime (->iso-8601-datetime [this timezone-id] (time/unparse (ISO8601Formatter timezone-id) this)))
+
+
 ;;; ## Date Stuff
+
+(defn is-temporal?
+  "Is VALUE an instance of a datetime class like `java.util.Date` or `org.joda.time.DateTime`?"
+  [v]
+  (or (instance? java.util.Date v)
+      (instance? org.joda.time.DateTime v)))
 
 (defn new-sql-timestamp
   "`java.sql.Date` doesn't have an empty constructor so this is a convenience that lets you make one with the current date.
@@ -82,10 +114,6 @@
    (format-date date-format (System/currentTimeMillis)))
   (^String [date-format date]
    (time/unparse (->DateTimeFormatter date-format) (coerce/from-long (.getTime (->Timestamp date))))))
-
-(def ^{:arglists '([] [date])} date->yyyy-mm-dd
-  "Format DATE as a `YYYY-MM-DD` string."
-  (partial format-date "yyyy-MM-dd"))
 
 (def ^{:arglists '([] [date])} date->iso-8601
   "Format DATE a an ISO-8601 string."
@@ -206,57 +234,56 @@
      (contains? date-trunc-units unit)
      (date-trunc unit date))))
 
+(defn format-nanoseconds
+  "Format a time interval in nanoseconds to something more readable (µs/ms/etc.)
+   Useful for logging elapsed time when using `(System/nanotime)`"
+  [nanoseconds]
+  (loop [n nanoseconds, [[unit divisor] & more] [[:ns 1000] [:µs 1000] [:ms 1000] [:s 1000] [:mins 60] [:hours 60]]]
+    (if (and (> n divisor)
+             (seq more))
+      (recur (/ n divisor) more)
+      (format "%.0f %s" (double n) (name unit)))))
+
 
 ;;; ## Etc
 
-(defmacro -assoc*
-  "Internal. Don't use this directly; use `assoc*` instead."
-  [k v & more]
- `(let [~'<> (assoc ~'<> ~k ~v)]
-    ~(if (empty? more) `~'<>
-         `(-assoc* ~@more))))
+(defprotocol ^:private IClobToStr
+  (jdbc-clob->str ^String [this]
+   "Convert a Postgres/H2/SQLServer JDBC Clob to a string."))
 
-(defmacro assoc*
-  "Like `assoc`, but associations happen sequentially; i.e. each successive binding can build
-   upon the result of the previous one using `<>`.
+(extend-protocol IClobToStr
+  nil     (jdbc-clob->str [_]    nil)
+  Object  (jdbc-clob->str [this] this)
 
-    (assoc* {}
-            :a 100
-            :b (+ 100 (:a <>)) ; -> {:a 100 :b 200}"
-  [object & kvs]
-  `((fn [~'<>] ; wrap in a `fn` so this can be used in `->`/`->>` forms
-      (-assoc* ~@kvs))
-    ~object))
+  org.postgresql.util.PGobject
+  (jdbc-clob->str [this] (.getValue this))
 
-(defn format-num
-  "format a number into a more human readable form."
-  [number]
-  {:pre [(number? number)]}
-  (let [decimal-type? #(or (float? %) (decimal? %))]
-    (cond
-      ;; looks like this is a decimal number, format with precision of 2
-      (and (decimal-type? number) (not (zero? (mod number 1)))) (format "%,.2f" number)
-      ;; this is a decimal type number with no actual decimal value, so treat it as a whole number
-      (decimal-type? number) (format "%,d" (long number))
-      ;; otherwise this is a whole number
-      :else (format "%,d" number))))
+  ;; H2 + SQLServer clobs both have methods called `.getCharacterStream` that officially return a `Reader`,
+  ;; but in practice I've only seen them return a `BufferedReader`. Just to be safe include a method to convert
+  ;; a plain `Reader` to a `BufferedReader` so we don't get caught with our pants down
+  java.io.Reader
+  (jdbc-clob->str [this]
+    (jdbc-clob->str (java.io.BufferedReader. this)))
 
-(defn jdbc-clob->str
-  "Convert a `JdbcClob` or `PGobject` to a `String`."
-  (^String
-   [clob]
-   (when clob
-     (condp = (type clob)
-       java.lang.String             clob
-       org.postgresql.util.PGobject (.getValue ^org.postgresql.util.PGobject clob)
-       org.h2.jdbc.JdbcClob         (->> (jdbc-clob->str (.getCharacterStream ^org.h2.jdbc.JdbcClob clob) [])
-                                         (interpose "\n")
-                                         (apply str)))))
-  ([^java.io.BufferedReader reader acc]
-   (if-let [line (.readLine reader)]
-     (recur reader (conj acc line))
-     (do (.close reader)
-         acc))))
+  ;; Read all the lines for the `BufferedReader` and combine into a single `String`
+  java.io.BufferedReader
+  (jdbc-clob->str [this]
+    (with-open [_ this]
+      (loop [acc []]
+        (if-let [line (.readLine this)]
+          (recur (conj acc line))
+          (apply str (interpose "\n" acc))))))
+
+  ;; H2 -- See also http://h2database.com/javadoc/org/h2/jdbc/JdbcClob.html
+  org.h2.jdbc.JdbcClob
+  (jdbc-clob->str [this]
+    (jdbc-clob->str (.getCharacterStream this)))
+
+  ;; SQL Server -- See also http://jtds.sourceforge.net/doc/net/sourceforge/jtds/jdbc/ClobImpl.html
+  net.sourceforge.jtds.jdbc.ClobImpl
+  (jdbc-clob->str [this]
+    (jdbc-clob->str (.getCharacterStream this))))
+
 
 (defn optional
   "Helper function for defining functions that accept optional arguments.
@@ -284,7 +311,7 @@
   [string]
   (boolean (when string
              (re-matches #"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
-                         (clojure.string/lower-case string)))))
+                         (s/lower-case string)))))
 
 (defn is-url?
   "Is STRING a valid HTTP/HTTPS URL?"
@@ -293,8 +320,9 @@
              (when-let [^java.net.URL url (try (java.net.URL. string)
                                                (catch java.net.MalformedURLException _
                                                  nil))]
-               (and (re-matches #"^https?$" (.getProtocol url))          ; these are both automatically downcased
-                    (re-matches #"^.+\..{2,}$" (.getAuthority url))))))) ; this is the part like 'google.com'. Make sure it contains at least one period and 2+ letter TLD
+               (when (and (.getProtocol url) (.getAuthority url))
+                 (and (re-matches #"^https?$" (.getProtocol url))           ; these are both automatically downcased
+                      (re-matches #"^.+\..{2,}$" (.getAuthority url)))))))) ; this is the part like 'google.com'. Make sure it contains at least one period and 2+ letter TLD
 
 (def ^:private ^:const host-up-timeout
   "Timeout (in ms) for checking if a host is available with `host-up?` and `host-port-up?`."
@@ -302,13 +330,13 @@
 
 (defn host-port-up?
   "Returns true if the port is active on a given host, false otherwise"
-  [^String hostname ^Integer port]
+  [^String hostname, ^Integer port]
   (try
     (let [sock-addr (InetSocketAddress. hostname port)]
       (with-open [sock (Socket.)]
-        (. sock connect sock-addr host-up-timeout)
+        (.connect sock sock-addr host-up-timeout)
         true))
-    (catch Exception _ false)))
+    (catch Throwable _ false)))
 
 (defn host-up?
   "Returns true if the host given by hostname is reachable, false otherwise "
@@ -316,7 +344,7 @@
   (try
     (let [host-addr (InetAddress/getByName hostname)]
       (.isReachable host-addr host-up-timeout))
-    (catch Exception _ false)))
+    (catch Throwable _ false)))
 
 (defn rpartial
   "Like `partial`, but applies additional args *before* BOUND-ARGS.
@@ -328,59 +356,69 @@
   (fn [& args]
     (apply f (concat args bound-args))))
 
-(defmacro deref->
-  "Threads OBJ through FORMS, calling `deref` after each.
-   Now you can write:
-
-    (deref-> (sel :one Field :id 12) :table :db :organization)
-
-   Instead of:
-
-    @(:organization @(:db @(:table (sel :one Field :id 12))))"
-  {:arglists '([obj & forms])}
-  [obj & forms]
-  `(-> ~obj
-       ~@(interpose 'deref forms)
-       deref))
-
-(defn require-dox-in-this-namespace
-  "Throw an exception if any public interned symbol in this namespace is missing a docstring."
-  []
-  (->> (ns-publics *ns*)
-       (map (fn [[symb varr]]
-              (when-not (:doc (meta varr))
-                (throw (Exception. (format "All public symbols in %s are required to have a docstring, but %s is missing one." (.getName *ns*) symb))))))
-       dorun))
-
 (defmacro pdoseq
-  "Just like `doseq` but runs in parallel."
+  "(Almost) just like `doseq` but runs in parallel. Doesn't support advanced binding forms like `:let` or `:when` and only supports a single binding </3"
   [[binding collection] & body]
+  {:style/indent 1}
   `(dorun (pmap (fn [~binding]
                   ~@body)
                 ~collection)))
 
-(defn indecies-satisfying
-  "Return a set of indencies in COLL that satisfy PRED.
+(defn first-index-satisfying
+  "Return the index of the first item in COLL where `(pred item)` is logically `true`.
 
-    (indecies-satisfying keyword? ['a 'b :c 3 :e])
-      -> #{2 4}"
+     (first-index-satisfying keyword? ['a 'b :c 3 \"e\"]) -> 2"
   [pred coll]
-  (->> (for [[i item] (m/indexed coll)]
-         (when (pred item)
-           i))
-       (filter identity)
-       set))
+  (loop [i 0, [item & more] coll]
+    (cond
+      (pred item) i
+      (seq more)  (recur (inc i) more))))
 
-(defn format-color
+(defmacro prog1
+  "Execute FIRST-FORM, then any other expressions in BODY, presumably for side-effects; return the result of FIRST-FORM.
+
+     (def numbers (atom []))
+
+     (defn find-or-add [n]
+       (or (first-index-satisfying (partial = n) @numbers)
+           (prog1 (count @numbers)
+             (swap! numbers conj n))))
+
+     (find-or-add 100) -> 0
+     (find-or-add 200) -> 1
+     (find-or-add 100) -> 0
+
+   The result of FIRST-FIRST is bound to the anaphor `<>`, which is convenient for logging:
+
+     (prog1 (some-expression)
+       (println \"RESULTS:\" <>))
+
+  `prog1` is an anaphoric version of the traditional macro of the same name in
+   [Emacs Lisp](http://www.gnu.org/software/emacs/manual/html_node/elisp/Sequencing.html#index-prog1)
+   and [Common Lisp](http://www.lispworks.com/documentation/HyperSpec/Body/m_prog1c.htm#prog1)."
+  {:style/indent 1}
+  [first-form & body]
+  `(let [~'<> ~first-form]
+     ~@body
+     ~'<>))
+
+(def ^String ^{:style/indent 2} format-color
   "Like `format`, but uses a function in `colorize.core` to colorize the output.
    COLOR-SYMB should be a quoted symbol like `green`, `red`, `yellow`, `blue`,
    `cyan`, `magenta`, etc. See the entire list of avaliable colors
    [here](https://github.com/ibdknox/colorize/blob/master/src/colorize/core.clj).
 
      (format-color 'red \"Fatal error: %s\" error-message)"
-  [color-symb format-string & args]
-  {:pre [(symbol? color-symb)]}
-  ((ns-resolve 'colorize.core color-symb) (apply format format-string args)))
+  (if (config/config-bool :mb-colorize-logs)
+    (fn
+      ([color-symb x]
+       {:pre [(symbol? color-symb)]}
+       ((ns-resolve 'colorize.core color-symb) x))
+      ([color-symb format-string & args]
+       (format-color color-symb (apply format format-string args))))
+    (fn
+      ([_ x] x)
+      ([_ format-string & args] (apply format format-string args)))))
 
 (defn pprint-to-str
   "Returns the output of pretty-printing X as a string.
@@ -394,20 +432,45 @@
   ([color-symb x]
    ((ns-resolve 'colorize.core color-symb) (pprint-to-str x))))
 
-(defmacro cond-let
-  "Like `if-let` or `when-let`, but for `cond`."
-  [binding-form then-form & more]
-  `(if-let ~binding-form ~then-form
-           ~(when (seq more)
-              `(cond-let ~@more))))
+(def emoji-progress-bar
+  "Create a string that shows sync progress for a database.
+
+     (sync-progress-meter-string 10 40)
+       -> \"[************······································] 25%\""
+  (let [^:const meter-width    50
+        ^:const progress-emoji ["😱"  ; face screaming in fear
+                                "😢"  ; crying face
+                                "😞"  ; disappointed face
+                                "😒"  ; unamused face
+                                "😕"  ; confused face
+                                "😐"  ; neutral face
+                                "😬"  ; grimacing face
+                                "😌"  ; relieved face
+                                "😏"  ; smirking face
+                                "😋"  ; face savouring delicious food
+                                "😊"  ; smiling face with smiling eyes
+                                "😍"  ; smiling face with heart shaped eyes
+                                "😎"] ; smiling face with sunglasses
+        percent-done->emoji    (fn [percent-done]
+                                 (progress-emoji (int (math/round (* percent-done (dec (count progress-emoji)))))))]
+    (fn [completed total]
+      (let [percent-done (float (/ completed total))
+            filleds      (int (* percent-done meter-width))
+            blanks       (- meter-width filleds)]
+        (str "["
+             (apply str (repeat filleds "*"))
+             (apply str (repeat blanks "·"))
+             (format "] %s  %3.0f%%" (percent-done->emoji percent-done) (* percent-done 100.0)))))))
 
 (defn filtered-stacktrace
   "Get the stack trace associated with E and return it as a vector with non-metabase frames filtered out."
   [^Throwable e]
   (when e
     (when-let [stacktrace (.getStackTrace e)]
-      (filterv (partial re-find #"metabase")
-               (map str (.getStackTrace e))))))
+      (vec (for [frame stacktrace
+                 :let  [s (str frame)]
+                 :when (re-find #"metabase" s)]
+             (s/replace s #"^metabase\." ""))))))
 
 (defn wrap-try-catch
   "Returns a new function that wraps F in a `try-catch`. When an exception is caught, it is logged
@@ -422,12 +485,15 @@
        (try
          (apply f args)
          (catch java.sql.SQLException e
-           (log/error (color/red exception-message "\n"
-                                 (with-out-str (jdbc/print-sql-exception-chain e)) "\n"
-                                 (pprint-to-str (filtered-stacktrace e)))))
+           (log/error (format-color 'red "%s\n%s\n%s"
+                                    exception-message
+                                    (with-out-str (jdbc/print-sql-exception-chain e))
+                                    (pprint-to-str (filtered-stacktrace e)))))
          (catch Throwable e
-           (log/error (color/red exception-message (or (.getMessage e) e) "\n"
-                                 (pprint-to-str (filtered-stacktrace e))))))))))
+           (log/error (format-color 'red "%s %s\n%s"
+                                    exception-message
+                                    (or (.getMessage e) e)
+                                    (pprint-to-str (filtered-stacktrace e))))))))))
 
 (defn try-apply
   "Like `apply`, but wraps F inside a `try-catch` block and logs exceptions caught.
@@ -445,40 +511,10 @@
                                                      (last args)
                                                      [(last args)]))))
 
-(defn wrap-try-catch!
-  "Re-intern FN-SYMB as a new fn that wraps the original with a `try-catch`. Intended for debugging.
-
-     (defn z [] (throw (Exception. \"!\")))
-     (z) ; -> exception
-
-     (wrap-try-catch! 'z)
-     (z) ; -> nil; exception logged with log/error"
-  [fn-symb]
-  {:pre [(symbol? fn-symb)
-         (fn? @(resolve fn-symb))]}
-  (let [varr                    (resolve fn-symb)
-        {nmspc :ns, symb :name} (meta varr)]
-    (println (format "wrap-try-catch! %s/%s" nmspc symb))
-    (intern nmspc symb (wrap-try-catch @varr fn-symb))))
-
-(defn ns-wrap-try-catch!
-  "Re-intern all functions in NAMESPACE as ones that wrap the originals with a `try-catch`.
-   Defaults to the current namespace. You may optionally exclude a set of symbols using the kwarg `:exclude`.
-
-     (ns-wrap-try-catch!)
-     (ns-wrap-try-catch! 'metabase.driver)
-     (ns-wrap-try-catch! 'metabase.driver :exclude 'query-complete)
-
-   Intended for debugging."
-  {:arglists '([namespace? :exclude & excluded-symbs])}
-  [& args]
-  (let [[nmspc args] (optional #(try-apply the-ns [%]) args *ns*)
-        excluded     (when (= (first args) :exclude)
-                       (set (rest args)))]
-    (doseq [[symb varr] (ns-interns nmspc)]
-      (when (fn? @varr)
-        (when-not (contains? excluded symb)
-          (wrap-try-catch! (symbol (str (ns-name nmspc) \/ symb))))))))
+(defmacro try-ignore-exceptions
+  "Simple macro which wraps the given expression in a try/catch block and ignores the exception if caught."
+  [& body]
+  `(try ~@body (catch Throwable ~'_)))
 
 (defn deref-with-timeout
   "Call `deref` on a FUTURE and throw an exception if it takes more than TIMEOUT-MS."
@@ -518,7 +554,51 @@
 
      (round-to-decimals 2 35.5058998M) -> 35.51"
   ^Double [^Integer decimal-place, ^Number number]
+  {:pre [(integer? decimal-place) (number? number)]}
   (double (.setScale (bigdec number) decimal-place BigDecimal/ROUND_HALF_UP)))
 
+(defn drop-first-arg
+  "Returns a new fn that drops its first arg and applies the rest to the original.
+   Useful for creating `extend` method maps when you don't care about the `this` param. :flushed:
 
-(require-dox-in-this-namespace)
+     ((drop-first-arg :value) xyz {:value 100}) -> (apply :value [{:value 100}]) -> 100"
+  ^clojure.lang.IFn [^clojure.lang.IFn f]
+  (comp (partial apply f) rest list))
+
+
+(defn- check-protocol-impl-method-map
+  "Check that the methods expected for PROTOCOL are all implemented by METHOD-MAP, and that no extra methods are provided.
+   Used internally by `strict-extend`."
+  [protocol method-map]
+  (let [[missing-methods extra-methods] (data/diff (set (keys (:method-map protocol))) (set (keys method-map)))]
+    (when missing-methods
+      (throw (Exception. (format "Missing implementations for methods in %s: %s" (:var protocol) missing-methods))))
+    (when extra-methods
+      (throw (Exception. (format "Methods implemented that are not in %s: %s " (:var protocol) extra-methods))))))
+
+(defn strict-extend
+  "A strict version of `extend` that throws an exception if any methods declared in the protocol are missing or any methods not
+   declared in the protocol are provided.
+   Since this has better compile-time error-checking, prefer `strict-extend` to regular `extend` in all situations, and to
+   `extend-protocol`/ `extend-type` going forward." ; TODO - maybe implement strict-extend-protocol and strict-extend-type ?
+  {:style/indent 1}
+  [atype protocol method-map & more]
+  (check-protocol-impl-method-map protocol method-map)
+  (extend atype protocol method-map)
+  (when (seq more)
+    (apply strict-extend atype more)))
+
+(def ^:private ^:const slugify-valid-chars
+  #{\a \b \c \d \e \f \g \h \i \j \k \l \m \n \o \p \q \r \s \t \u \v \w \x \y \z
+    \0 \1 \2 \3 \4 \5 \6 \7 \8 \9
+    \_})
+
+(defn slugify
+  "Return a version of `String` S appropriate for use as a URL slug.
+   Downcase the name and replace non-alphanumeric characters with underscores."
+  ^String [s]
+  (when (seq s)
+    (apply str (for [c (s/lower-case (name s))]
+                 (if (contains? slugify-valid-chars c)
+                   c
+                   \_)))))

@@ -3,9 +3,8 @@ import React, { Component, PropTypes } from "react";
 import Icon from "metabase/components/Icon.jsx";
 
 import Query from "metabase/lib/query";
-import { parseFieldTarget, parseFieldBucketing, formatBucketing } from "metabase/lib/query_time";
+import { formatBucketing, parseFieldBucketing, parseFieldTarget } from "metabase/lib/query_time";
 import { isDate } from "metabase/lib/schema_metadata";
-
 import { stripId } from "metabase/lib/formatting";
 
 import _ from "underscore";
@@ -15,6 +14,7 @@ export default class FieldName extends Component {
     static propTypes = {
         field: PropTypes.oneOfType([PropTypes.number, PropTypes.array]),
         fieldOptions: PropTypes.object.isRequired,
+        customFieldOptions: PropTypes.object,
         onClick: PropTypes.func,
         removeField: PropTypes.func,
         tableMetadata: PropTypes.object.isRequired
@@ -26,7 +26,7 @@ export default class FieldName extends Component {
 
     render() {
         let targetTitle, fkTitle, fkIcon, bucketingTitle;
-        let { field, fieldOptions, tableMetadata } = this.props;
+        let { field, fieldOptions } = this.props;
 
         let bucketing = parseFieldBucketing(field);
         field = parseFieldTarget(field);
@@ -41,6 +41,10 @@ export default class FieldName extends Component {
                     fkIcon = (<span className="px1"><Icon name="connections" width="10" height="10" /></span>);
                 }
             }
+        } else if (Query.isExpressionField(field)) {
+            fieldDef = {
+                display_name: field[1]
+            };
         } else {
             fieldDef = _.find(fieldOptions.fields, (f) => _.isEqual(f.id, field));
         }
@@ -49,8 +53,8 @@ export default class FieldName extends Component {
             targetTitle = (<span>{fieldDef.display_name}</span>);
         }
 
-        // Mongo doesn't support non-default time bucketing so don't show it
-        if (fieldDef && isDate(fieldDef) && tableMetadata.db.engine !== "mongo") {
+        // if this is a datetime field then add an extra bit of labeling about the time bucket
+        if (fieldDef && isDate(fieldDef)) {
             bucketingTitle = ": " + formatBucketing(bucketing);
         }
 
@@ -68,7 +72,7 @@ export default class FieldName extends Component {
         var removeButton;
         if (this.props.removeField) {
             removeButton = (
-                <a className="text-grey-2 no-decoration pr1 flex align-center" href="#" onClick={this.props.removeField}>
+                <a className="text-grey-2 no-decoration pr1 flex align-center" onClick={this.props.removeField}>
                     <Icon name='close' width="14px" height="14px" />
                 </a>
             )

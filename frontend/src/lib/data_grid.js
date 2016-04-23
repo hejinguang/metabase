@@ -1,6 +1,7 @@
 import _ from "underscore";
 
 import * as SchemaMetadata from "metabase/lib/schema_metadata";
+import { formatValue } from "metabase/lib/formatting";
 
 function compareNumbers(a, b) {
     return a - b;
@@ -9,8 +10,8 @@ function compareNumbers(a, b) {
 
 var DataGrid = {
     filterOnPreviewDisplay: function(data) {
-        // find any columns where preview_display = false
-        var hiddenColumnIdxs = _.map(data.cols, function(col, idx) { if(!col.preview_display) return idx; });
+        // find any columns where visibility_type = details-only
+        var hiddenColumnIdxs = _.map(data.cols, function(col, idx) { if(col.visibility_type === "details-only") return idx; });
         hiddenColumnIdxs = _.filter(hiddenColumnIdxs, function(val) { return val !== undefined; });
 
         // filter out our data grid using the indexes of the hidden columns
@@ -25,7 +26,7 @@ var DataGrid = {
         });
 
         return {
-            cols: _.filter(data.cols, function(col) { return col.preview_display; }),
+            cols: _.filter(data.cols, function(col) { return col.visibility_type !== "details-only"; }),
             columns: _.map(data.cols, function(col) { return col.display_name; }),
             rows: filteredRows,
             rows_truncated: data.rows_truncated
@@ -37,6 +38,7 @@ var DataGrid = {
         // TODO: we assume dimensions are in the first 2 columns, which is less than ideal
         var pivotCol = 0,
             normalCol = 1,
+            cellCol = 2,
             pivotColValues = DataGrid.distinctValues(data, pivotCol),
             normalColValues = DataGrid.distinctValues(data, normalCol);
         if (normalColValues.length <= pivotColValues.length) {
@@ -89,9 +91,8 @@ var DataGrid = {
                 return data.cols[normalCol];
             }
 
-            var colDef = _.clone(data.cols[pivotCol]);
-            colDef['display_name'] = val || "";
-            colDef['name'] = val || "";
+            var colDef = _.clone(data.cols[cellCol]);
+            colDef['name'] = colDef['display_name'] = formatValue(val, { column: data.cols[pivotCol] });
             return colDef;
         });
 
